@@ -3,6 +3,7 @@
 
 Usage:
     python evaluate_detector.py --model wav2vec2-spoofing --input-dir ./data/test_audio --output-dir ./results
+    python evaluate_detector.py --model wav2vec2-spoofing --input-dir ./data/test_audio --output-dir ./results --threshold 0.7 --max-duration 30
 """
 
 import argparse
@@ -15,6 +16,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from vigil.detectors import get_detector
+from vigil.utils.audio import load_audio
 
 # Configure logging
 logging.basicConfig(
@@ -40,14 +42,18 @@ def evaluate_detector(
     model_name: str,
     input_dir: str,
     output_dir: str,
+    threshold: float = 0.5,
+    max_duration: float = 30.0,
     device: str = "cpu"
 ) -> None:
     """Run detector on all audio files in input directory.
     
     Args:
-        model_name: Name of detector ("wav2vec2-spoofing" or "rawnet2")
+        model_name: Name of detector ("wav2vec2-spoofing")
         input_dir: Path to directory containing WAV files
         output_dir: Path to write results
+        threshold: Classification threshold (default: 0.5)
+        max_duration: Maximum audio duration in seconds (default: 30.0)
         device: "cpu" or "cuda"
     """
     input_path = Path(input_dir)
@@ -59,6 +65,7 @@ def evaluate_detector(
     
     output_path.mkdir(parents=True, exist_ok=True)
     logger.info(f"Output directory: {output_path}")
+    logger.info(f"Threshold: {threshold}, Max duration: {max_duration}s")
     
     # Find audio files
     audio_files = find_wav_files(input_path)
@@ -79,16 +86,31 @@ def evaluate_detector(
     # Run inference
     results = []
     errors = []
+    truncated = []
     
     for i, audio_file in enumerate(audio_files, 1):
         logger.info(f"[{i}/{len(audio_files)}] Processing: {audio_file.name}")
+        
+        # Check audio duration
+        waveform, sr = load_audio(str(audio_file), target_sr=16000, max_duration=None)
+        if waveform is not None and sr is not None:
+            duration = len(waveform) / sr
+            if duration > max_duration:
+                logger.warning(
+                    f"  Audio duration {duration:.1f}s exceeds max {max_duration}s. Truncating."
+                )
+                truncated.append({
+                    "filename": audio_file.name,
+                    "original_duration_s": duration,
+                    "max_duration_s": max_duration
+                })
         
         try:
             result = detector.detect(str(audio_file))
             result["filename"] = audio_file.name
             result["filepath"] = str(audio_file)
             result["predicted_class"] = (
-                "synthetic" if result["synthetic_probability"] > 0.5 else "bonafide"
+                "synthetic" if result["synthetic_probability"] > threshold else "bonafide"
             )
             results.append(result)
             
@@ -118,9 +140,12 @@ def evaluate_detector(
     summary = {
         "model": model_name,
         "device": device,
+        "threshold": threshold,
+        "max_duration_s": max_duration,
         "total_files": len(audio_files),
         "successful": len(results),
         "errors": len(errors),
+        "truncated": len(truncated),
         "synthetic_count": sum(1 for r in results if r["predicted_class"] == "synthetic"),
         "bonafide_count": sum(1 for r in results if r["predicted_class"] == "bonafide"),
         "mean_latency_ms": (
@@ -145,6 +170,14 @@ def evaluate_detector(
             for error in errors:
                 f.write(json.dumps(error) + "\n")
     
+    # Write truncated
+    if truncated:
+        truncated_file = output_path / f"{model_name}_truncated.jsonl"
+        logger.info(f"Writing {len(truncated)} truncation notices to {truncated_file}")
+        with open(truncated_file, "w") as f:
+            for item in truncated:
+                f.write(json.dumps(item) + "\n")
+    
     # Print summary
     logger.info("\n" + "="*60)
     logger.info(f"EVALUATION SUMMARY ({model_name})")
@@ -152,10 +185,12 @@ def evaluate_detector(
     logger.info(f"Total files processed: {len(audio_files)}")
     logger.info(f"Successful: {len(results)}")
     logger.info(f"Errors: {len(errors)}")
+    logger.info(f"Truncated: {len(truncated)}")
     logger.info(f"Synthetic detected: {summary['synthetic_count']}")
     logger.info(f"Bonafide detected: {summary['bonafide_count']}")
     logger.info(f"Mean inference latency: {summary['mean_latency_ms']:.1f}ms")
     logger.info(f"Mean synthetic probability: {summary['mean_synthetic_probability']:.3f}")
+    logger.info(f"Threshold: {threshold}")
     logger.info("="*60 + "\n")
 
 
@@ -167,7 +202,7 @@ def main():
     parser.add_argument(
         "--model",
         required=True,
-        choices=["wav2vec2-spoofing", "rawnet2"],
+        choices=["wav2vec2-spoofing"],
         help="Model to use for detection"
     )
     parser.add_argument(
@@ -179,6 +214,18 @@ def main():
         "--output-dir",
         default="./results",
         help="Directory to write results (default: ./results)"
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Classification threshold for synthetic (default: 0.5)"
+    )
+    parser.add_argument(
+        "--max-duration",
+        type=float,
+        default=30.0,
+        help="Maximum audio duration in seconds (default: 30.0)"
     )
     parser.add_argument(
         "--device",
@@ -193,6 +240,8 @@ def main():
         model_name=args.model,
         input_dir=args.input_dir,
         output_dir=args.output_dir,
+        threshold=args.threshold,
+        max_duration=args.max_duration,
         device=args.device
     )
 

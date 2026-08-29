@@ -6,6 +6,7 @@ Example: bonafide_001.wav, synthetic_042.wav
 
 Usage:
     python evaluate_with_labels.py --model wav2vec2-spoofing --input-dir ./data/labeled_audio --output-dir ./results
+    python evaluate_with_labels.py --model wav2vec2-spoofing --input-dir ./data/labeled_audio --output-dir ./results --threshold 0.7
 """
 
 import argparse
@@ -52,14 +53,16 @@ def evaluate_with_labels(
     model_name: str,
     input_dir: str,
     output_dir: str,
+    threshold: float = 0.5,
     device: str = "cpu"
 ) -> None:
     """Evaluate detector on labeled audio files with metrics.
     
     Args:
-        model_name: Name of detector ("wav2vec2-spoofing" or "rawnet2")
+        model_name: Name of detector ("wav2vec2-spoofing")
         input_dir: Path to directory containing labeled WAV files
         output_dir: Path to write results
+        threshold: Classification threshold (default: 0.5)
         device: "cpu" or "cuda"
     """
     input_path = Path(input_dir)
@@ -70,6 +73,7 @@ def evaluate_with_labels(
         return
     
     output_path.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Threshold: {threshold}")
     
     # Find audio files
     audio_files = sorted(input_path.rglob("*.wav"))
@@ -93,10 +97,17 @@ def evaluate_with_labels(
         return
     
     logger.info(f"Parsed labels for {len(labeled_files)} files")
-    logger.info(
-        f"  Bonafide: {sum(1 for _, l in labeled_files if l == 'bonafide')}, "
-        f"Synthetic: {sum(1 for _, l in labeled_files if l == 'synthetic')}"
-    )
+    bonafide_count = sum(1 for _, l in labeled_files if l == 'bonafide')
+    synthetic_count = sum(1 for _, l in labeled_files if l == 'synthetic')
+    logger.info(f"  Bonafide: {bonafide_count}, Synthetic: {synthetic_count}")
+    
+    # Check class imbalance
+    total = len(labeled_files)
+    if bonafide_count / total < 0.1 or synthetic_count / total < 0.1:
+        logger.warning(
+            f"Class imbalance detected: {bonafide_count} bonafide, {synthetic_count} synthetic. "
+            f"Accuracy may be misleading. Use ROC-AUC for model comparison."
+        )
     
     # Initialize detector
     logger.info(f"Initializing {model_name} detector...")
@@ -121,7 +132,7 @@ def evaluate_with_labels(
             result["filename"] = audio_file.name
             result["ground_truth"] = ground_truth
             result["predicted_class"] = (
-                "synthetic" if result["synthetic_probability"] > 0.5 else "bonafide"
+                "synthetic" if result["synthetic_probability"] > threshold else "bonafide"
             )
             result["correct"] = result["predicted_class"] == ground_truth
             results.append(result)
@@ -174,6 +185,7 @@ def evaluate_with_labels(
     metrics = {
         "model": model_name,
         "device": device,
+        "threshold": threshold,
         "total_samples": len(labeled_files),
         "successful": len(results),
         "errors": len(errors),
@@ -223,6 +235,7 @@ def evaluate_with_labels(
     logger.info(f"Total samples: {len(labeled_files)}")
     logger.info(f"Successful: {len(results)}")
     logger.info(f"Errors: {len(errors)}")
+    logger.info(f"Threshold: {threshold}")
     logger.info("-" * 70)
     logger.info(f"Accuracy:   {accuracy:.4f}")
     logger.info(f"Precision:  {precision:.4f}")
@@ -245,7 +258,7 @@ def main():
     parser.add_argument(
         "--model",
         required=True,
-        choices=["wav2vec2-spoofing", "rawnet2"],
+        choices=["wav2vec2-spoofing"],
         help="Model to use for detection"
     )
     parser.add_argument(
@@ -257,6 +270,12 @@ def main():
         "--output-dir",
         default="./results",
         help="Directory to write results (default: ./results)"
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Classification threshold for synthetic (default: 0.5)"
     )
     parser.add_argument(
         "--device",
@@ -271,6 +290,7 @@ def main():
         model_name=args.model,
         input_dir=args.input_dir,
         output_dir=args.output_dir,
+        threshold=args.threshold,
         device=args.device
     )
 
