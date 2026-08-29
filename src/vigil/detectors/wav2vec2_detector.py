@@ -20,6 +20,9 @@ class Wav2Vec2Detector(DeepfakeDetector):
     
     Uses HuggingFace's wav2vec2-xlsr fine-tuned for speech spoofing detection.
     Supports 16kHz PCM WAV files.
+    
+    Class mapping is obtained from model configuration (id2label/label2id),
+    not hardcoded, ensuring compatibility with different model variants.
     """
 
     def __init__(self, model_path: str = None, device: str = "cpu"):
@@ -28,6 +31,9 @@ class Wav2Vec2Detector(DeepfakeDetector):
         Args:
             model_path: Optional path to custom model. Defaults to HuggingFace model.
             device: "cpu" or "cuda"
+            
+        Raises:
+            ValueError: If model does not have the required 'bonafide' and 'spoof' or 'synthetic' labels
         """
         self._device = device
         self._model_path = model_path or "aniemore/wav2vec2-xlsr-multilingual-speech-spoofing-detection"
@@ -44,9 +50,62 @@ class Wav2Vec2Detector(DeepfakeDetector):
             cache_dir=None
         )
         
+        # Extract class mapping from model configuration
+        self._init_class_mapping()
+        
         self.model.to(device)
         self.model.eval()
         logger.info(f"Model loaded on device: {device}")
+
+    def _init_class_mapping(self):
+        """Extract and validate class mapping from model configuration.
+        
+        Raises:
+            ValueError: If bonafide and synthetic classes cannot be reliably identified
+        """
+        # Try to get id2label from model config
+        id2label = None
+        if hasattr(self.model.config, 'id2label'):
+            id2label = self.model.config.id2label
+        
+        if id2label is None or len(id2label) < 2:
+            raise ValueError(
+                f"Model {self._model_path} does not have a valid id2label mapping. "
+                f"Cannot identify bonafide and synthetic classes."
+            )
+        
+        # Normalize labels to lowercase for matching
+        label_map = {}  # label_text -> class_id
+        for class_id, label_text in id2label.items():
+            label_lower = label_text.lower().strip()
+            label_map[label_lower] = int(class_id)
+        
+        logger.debug(f"Extracted label mapping: {label_map}")
+        
+        # Identify bonafide class
+        bonafide_candidates = [lid for ltext, lid in label_map.items() 
+                              if ltext in ['bonafide', 'genuine', 'real']]
+        if not bonafide_candidates:
+            raise ValueError(
+                f"Cannot identify bonafide class in model labels: {list(label_map.keys())}. "
+                f"Expected one of: 'bonafide', 'genuine', 'real'"
+            )
+        self.bonafide_class_id = bonafide_candidates[0]
+        
+        # Identify synthetic class
+        synthetic_candidates = [lid for ltext, lid in label_map.items() 
+                               if ltext in ['spoof', 'synthetic', 'fake', 'generated', 'spoofed']]
+        if not synthetic_candidates:
+            raise ValueError(
+                f"Cannot identify synthetic class in model labels: {list(label_map.keys())}. "
+                f"Expected one of: 'spoof', 'synthetic', 'fake', 'generated', 'spoofed'"
+            )
+        self.synthetic_class_id = synthetic_candidates[0]
+        
+        logger.info(
+            f"Class mapping verified: bonafide={self.bonafide_class_id}, "
+            f"synthetic={self.synthetic_class_id}"
+        )
 
     def detect(self, audio_path: str) -> Dict[str, Any]:
         """Detect synthetic vs bonafide speech.
@@ -55,11 +114,12 @@ class Wav2Vec2Detector(DeepfakeDetector):
             audio_path: Path to 16kHz PCM WAV file
             
         Returns:
-            Detection result with probabilities and latency
+            Detection result with model softmax probabilities and latency
             
         Raises:
             FileNotFoundError: If audio file not found
             ValueError: If audio is invalid
+            RuntimeError: If model inference fails
         """
         audio_path = Path(audio_path)
         if not audio_path.exists():
@@ -86,13 +146,13 @@ class Wav2Vec2Detector(DeepfakeDetector):
                 outputs = self.model(**inputs)
             latency_ms = (time.time() - start_time) * 1000.0
 
-            # Parse output
+            # Parse output using learned class mapping
             logits = outputs.logits[0].cpu().numpy()
             probs = torch.softmax(torch.tensor(logits), dim=-1).numpy()
 
-            # Assuming class 0=bonafide, 1=synthetic (common in spoofing models)
-            bonafide_prob = float(probs[0])
-            synthetic_prob = float(probs[1])
+            # Extract probabilities using verified class IDs
+            bonafide_prob = float(probs[self.bonafide_class_id])
+            synthetic_prob = float(probs[self.synthetic_class_id])
 
             result = {
                 "synthetic_probability": synthetic_prob,
